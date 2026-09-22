@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 
@@ -16,7 +17,7 @@ import (
 )
 
 // loadConfig assembles a ready-to-Dial *openvpn.Config from CLI flags. Either
-// `-config FILE` is used (with optional overrides from -user/-pass/-sni/-port)
+// `-config FILE` is used (with optional overrides from -server/-user/-pass/-sni/-port)
 // OR all of -server/-ca/-cert?/-key?/-tls-crypt? are provided manually.
 func loadConfig(opts *cliOpts, logger *slog.Logger) (*openvpn.Config, error) {
 	if opts.configFile != "" {
@@ -27,29 +28,61 @@ func loadConfig(opts *cliOpts, logger *slog.Logger) (*openvpn.Config, error) {
 
 // loadFromOvpnFile parses a .ovpn profile and applies flag overrides.
 func loadFromOvpnFile(opts *cliOpts, logger *slog.Logger) (*openvpn.Config, error) {
+	var overrideHost string
+	var overridePort string
+
+	if opts.server != "" {
+		host, port, err := net.SplitHostPort(opts.server)
+		if err != nil {
+			return nil, fmt.Errorf("invalid -server %q: %w", opts.server, err)
+		}
+
+		overrideHost = host
+		overridePort = port
+	}
+
 	parsed, err := ovpn.ParseFile(opts.configFile, &ovpn.ParseOptions{
 		Username:              opts.user,
 		Password:              opts.pass,
 		ServerNameOverride:    opts.sni,
 		AllowNoServerIdentity: opts.allowNoServerIdentity,
+
 		PickRemote: func(remotes []ovpn.Remote) ovpn.Remote {
+			picked := remotes[0]
+
+			// Existing -port behavior.
 			if opts.port != "" {
 				for _, r := range remotes {
 					if r.Port == opts.port {
-						return r
+						picked = r
+						break
 					}
 				}
 			}
-			return remotes[0]
+
+			// -server has final precedence.
+			if overrideHost != "" {
+				picked.Host = overrideHost
+				picked.Port = overridePort
+			}
+
+			return picked
 		},
+
 		Warn: func(line int, dir, reason string) {
-			logger.Debug("ovpn parser warning",
-				"line", line, "directive", dir, "reason", reason)
+			logger.Debug(
+				"ovpn parser warning",
+				"line", line,
+				"directive", dir,
+				"reason", reason,
+			)
 		},
 	})
+
 	if err != nil {
 		return nil, fmt.Errorf("parse .ovpn: %w", err)
 	}
+
 	if parsed.AuthUserPass && (parsed.Config.Username == "" || parsed.Config.Password == "") {
 		return nil, errors.New("the profile requires auth-user-pass; provide -user/-pass or $OVPN_USER/$OVPN_PASS")
 	}
@@ -79,6 +112,36 @@ func loadFromOvpnFile(opts *cliOpts, logger *slog.Logger) (*openvpn.Config, erro
 	return parsed.Config, nil
 }
 
+func allowNoServerIdentity(tlsCfg *tls.Config) {
+	tlsCfg.InsecureSkipVerify = true
+
+	roots := tlsCfg.RootCAs
+
+	tlsCfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("no peer certificate presented")
+		}
+
+		opts := x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: x509.NewCertPool(),
+			KeyUsages: []x509.ExtKeyUsage{
+				x509.ExtKeyUsageServerAuth,
+			},
+		}
+
+		for _, cert := range cs.PeerCertificates[1:] {
+			opts.Intermediates.AddCert(cert)
+		}
+
+		if _, err := cs.PeerCertificates[0].Verify(opts); err != nil {
+			return fmt.Errorf("server cert verify: %w", err)
+		}
+
+		return nil
+	}
+}
+
 // loadFromFlags constructs a Config from manual flag set (no .ovpn file).
 func loadFromFlags(opts *cliOpts, _ *slog.Logger) (*openvpn.Config, error) {
 	if opts.server == "" {
@@ -95,9 +158,6 @@ func loadFromFlags(opts *cliOpts, _ *slog.Logger) (*openvpn.Config, error) {
 	}
 
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if opts.sni != "" {
-		tlsCfg.ServerName = opts.sni
-	}
 
 	if opts.caFile != "" {
 		b, err := os.ReadFile(opts.caFile)
@@ -109,6 +169,18 @@ func loadFromFlags(opts *cliOpts, _ *slog.Logger) (*openvpn.Config, error) {
 			return nil, fmt.Errorf("read -ca: no certificates parsed")
 		}
 		tlsCfg.RootCAs = pool
+	}
+
+	if opts.sni != "" {
+		tlsCfg.ServerName = opts.sni
+	} else {
+		if !opts.allowNoServerIdentity {
+			return nil, errors.New(
+				"manual mode requires -sni or -allow-no-server-identity",
+			)
+		}
+
+		allowNoServerIdentity(tlsCfg)
 	}
 	if (opts.certFile == "") != (opts.keyFile == "") {
 		return nil, errors.New("-cert and -key must both be set or both omitted")

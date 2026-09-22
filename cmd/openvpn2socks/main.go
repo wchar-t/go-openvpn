@@ -63,7 +63,7 @@ func parseFlags() *cliOpts {
 
 	// OpenVPN endpoint.
 	flag.StringVar(&o.configFile, "config", "", ".ovpn profile path (alternative to manual -server/-ca/-cert/... flags)")
-	flag.StringVar(&o.server, "server", "", "OpenVPN remote (host:port)")
+	flag.StringVar(&o.server, "server", "", "OpenVPN remote (host:port); overrides profile remote when -config is used")
 	flag.StringVar(&o.network, "network", "udp", "transport: udp or tcp")
 	flag.StringVar(&o.user, "user", os.Getenv("OVPN_USER"), "auth-user-pass username (default: $OVPN_USER)")
 	flag.StringVar(&o.pass, "pass", os.Getenv("OVPN_PASS"), "auth-user-pass password (default: $OVPN_PASS)")
